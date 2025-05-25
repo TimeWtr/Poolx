@@ -17,6 +17,7 @@ package poolx
 import (
 	"context"
 	"math/rand"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,11 +25,16 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
+var testChannelPool = sync.Pool{
+	New: func() interface{} {
+		return make(chan struct{}, 10)
+	},
+}
+
 func TestNewPool_String(t *testing.T) {
 	p, err := NewPool[string](10, func() string {
 		return ""
-	}, WithMetrics[string](),
-		WithMaxAge[string](time.Minute.Microseconds()))
+	}, WithMetrics[string]())
 	assert.NoError(t, err)
 	assert.NotNil(t, p)
 	defer p.Close()
@@ -78,8 +84,7 @@ func TestNewPool_Chan_Bytes(t *testing.T) {
 			}
 			close(c)
 		}),
-		WithMetrics[chan []byte](),
-		WithMaxAge[chan []byte](time.Minute.Microseconds()))
+		WithMetrics[chan []byte]())
 	assert.NoError(t, err)
 	assert.NotNil(t, p)
 	defer p.Close()
@@ -126,7 +131,7 @@ func TestNewPool_Struct(t *testing.T) {
 				Schema: "",
 				Addr:   "",
 				Port:   0,
-				Ch:     make(chan struct{}, 10),
+				Ch:     testChannelPool.Get().(chan struct{}),
 			}
 		},
 		WithResetFn[Instance](func(c Instance) Instance {
@@ -137,7 +142,6 @@ func TestNewPool_Struct(t *testing.T) {
 				select {
 				case <-c.Ch:
 				default:
-					c.Ch = make(chan struct{}, 10)
 					return c
 				}
 			}
@@ -148,12 +152,12 @@ func TestNewPool_Struct(t *testing.T) {
 				case <-i.Ch:
 				default:
 					close(i.Ch)
+					testChannelPool.Put(i.Ch)
 					return
 				}
 			}
 		}),
-		WithMetrics[Instance](),
-		WithMaxAge[Instance](time.Minute.Microseconds()))
+		WithMetrics[Instance]())
 	assert.NoError(t, err)
 	assert.NotNil(t, p)
 	defer p.Close()
@@ -201,7 +205,7 @@ func BenchmarkPool_Struct(b *testing.B) {
 				Schema: "",
 				Addr:   "",
 				Port:   0,
-				Ch:     make(chan struct{}, 10),
+				Ch:     testChannelPool.Get().(chan struct{}),
 			}
 		},
 		WithResetFn[Instance](func(c Instance) Instance {
@@ -223,6 +227,7 @@ func BenchmarkPool_Struct(b *testing.B) {
 				case <-i.Ch:
 				default:
 					close(i.Ch)
+					i.Ch = nil
 					return
 				}
 			}
