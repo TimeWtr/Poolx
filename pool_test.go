@@ -222,6 +222,10 @@ func BenchmarkPool_Struct(b *testing.B) {
 			}
 		}),
 		WithCloseFn[Instance](func(i Instance) {
+			i.Schema = ""
+			i.Addr = ""
+			i.Port = 0
+
 			for {
 				select {
 				case <-i.Ch:
