@@ -19,7 +19,6 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 const (
@@ -61,14 +60,6 @@ type wrapT[T any] struct {
 	data T
 }
 
-// Metadata 对象的元数据信息
-type Metadata struct {
-	isNew     bool  // 是否是新创建的
-	counter   int8  // 对象引用的计数器
-	createdAt int64 // 对象的创建时间，毫秒
-	updatedAt int64 // 对象的更新时间，毫秒
-}
-
 // Metrics 监控数据
 type Metrics struct {
 	allocations atomic.Int64 // 总共分配的对象计数
@@ -78,7 +69,6 @@ type Metrics struct {
 
 type Pool[T any] struct {
 	p              atomic.Pointer[sync.Pool] // 以官方包的pool为基础封装
-	objMap         sync.Map                  // 对象元数据集合
 	maxAge         int64                     // 对象的最大存活时间
 	capacity       atomic.Int32              // 池的容量限制
 	currentCounter atomic.Int32              // 当前池中已分配的对象数量
@@ -94,7 +84,6 @@ type Pool[T any] struct {
 func NewPool[T any](capacity int32, newFn func() T, opts ...Options[T]) (*Pool[T], error) {
 	p := &Pool[T]{
 		maxAge:  NotExpired,
-		objMap:  sync.Map{},
 		metrics: Metrics{},
 		newFn:   newFn,
 		dataMu:  sync.Mutex{},
@@ -112,18 +101,8 @@ func NewPool[T any](capacity int32, newFn func() T, opts ...Options[T]) (*Pool[T
 			// 设置SetFinalizer，当对象被GC回收时减少计数器，并删除对象集合中的
 			// 对象-元数据的映射关系
 			obj := &wrapT[T]{data: t}
-			runtime.SetFinalizer(obj, func(w *wrapT[T]) {
+			runtime.SetFinalizer(obj, func(_ *wrapT[T]) {
 				p.currentCounter.Add(-1)
-				p.objMap.Delete(w.data)
-			})
-
-			// 设置对象-元数据的映射关闭
-			now := time.Now().UnixMilli()
-			p.objMap.Store(t, Metadata{
-				isNew:     true,
-				counter:   1,
-				createdAt: now,
-				updatedAt: now,
 			})
 
 			if p.enableMetrics {
@@ -168,22 +147,9 @@ func (p *Pool[T]) Get() (t T, err error) {
 	if !ok {
 		runtime.SetFinalizer(&wrapT[T]{data: t}, nil)
 		p.currentCounter.Add(-1)
-		p.objMap.Delete(t)
 		return t, ErrObjectType
 	}
 
-	metadata, ok := p.objMap.Load(t)
-	if !ok {
-		return t, ErrObjectType
-	}
-
-	if val, _ := metadata.(Metadata); val.isNew {
-		p.objMap.Store(t, Metadata{
-			isNew:     false,
-			createdAt: val.createdAt,
-			updatedAt: time.Now().UnixMilli(),
-		})
-	}
 	p.metrics.totalGets.Add(1)
 
 	return t, nil
@@ -213,27 +179,12 @@ func (p *Pool[T]) Put(t T) {
 		if p.closeFn != nil {
 			p.closeFn(t)
 		}
-		p.objMap.Delete(t)
 
 		return
 	}
 
 	if p.resetFn != nil {
 		p.resetFn(t)
-	}
-
-	// 更新元数据中的更新时间
-	metadata, ok := p.objMap.Load(t)
-	if !ok {
-		return
-	}
-
-	if val, _ := metadata.(Metadata); val.isNew {
-		p.objMap.Store(t, Metadata{
-			isNew:     false,
-			createdAt: val.createdAt,
-			updatedAt: time.Now().UnixMilli(),
-		})
 	}
 
 	p.p.Load().Put(t)
@@ -248,11 +199,6 @@ func (p *Pool[T]) Close() {
 	defer p.dataMu.Unlock()
 	newPool := &sync.Pool{New: p.p.Load().New}
 	p.p.Store(newPool)
-
-	p.objMap.Range(func(key, _ interface{}) bool {
-		p.objMap.Delete(key)
-		return true
-	})
 }
 
 func (p *Pool[T]) Stats() (allocations, reuses, discards int64) {

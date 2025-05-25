@@ -133,17 +133,24 @@ func TestNewPool_Struct(t *testing.T) {
 			c.Schema = ""
 			c.Addr = ""
 			c.Port = 0
-			for len(c.Ch) > 0 {
-				<-c.Ch
+			for {
+				select {
+				case <-c.Ch:
+				default:
+					c.Ch = make(chan struct{}, 10)
+					return c
+				}
 			}
-			c.Ch = make(chan struct{}, 10)
-			return c
 		}),
 		WithCloseFn[Instance](func(i Instance) {
-			for len(i.Ch) > 0 {
-				<-i.Ch
+			for {
+				select {
+				case <-i.Ch:
+				default:
+					close(i.Ch)
+					return
+				}
 			}
-			close(i.Ch)
 		}),
 		WithMetrics[Instance](),
 		WithMaxAge[Instance](time.Minute.Microseconds()))
@@ -201,16 +208,24 @@ func BenchmarkPool_Struct(b *testing.B) {
 			c.Schema = ""
 			c.Addr = ""
 			c.Port = 0
-			for len(c.Ch) > 0 {
-				<-c.Ch
+
+			for {
+				select {
+				case <-c.Ch:
+				default:
+					return c
+				}
 			}
-			return c
 		}),
 		WithCloseFn[Instance](func(i Instance) {
-			for len(i.Ch) > 0 {
-				<-i.Ch
+			for {
+				select {
+				case <-i.Ch:
+				default:
+					close(i.Ch)
+					return
+				}
 			}
-			close(i.Ch)
 		}),
 	)
 	defer p.Close()
