@@ -205,7 +205,6 @@ func BenchmarkPool_Struct(b *testing.B) {
 				Schema: "",
 				Addr:   "",
 				Port:   0,
-				Ch:     testChannelPool.Get().(chan struct{}),
 			}
 		},
 		WithResetFn[Instance](func(c Instance) Instance {
@@ -245,7 +244,35 @@ func BenchmarkPool_Struct(b *testing.B) {
 		for pb.Next() {
 			obj, _ := p.Get()
 			for i := 0; i < rand.Intn(10); i++ {
-				obj.Ch <- struct{}{}
+				//obj.Ch <- struct{}{}
+			}
+			p.Put(obj)
+		}
+	})
+}
+
+func BenchmarkPool_Big_Bytes(b *testing.B) {
+	// 初始化对象池（避免计时器包含初始化耗时）
+	const size = 1 << 20 // 1MB
+	p, _ := NewPool[*[]byte](10,
+		func() *[]byte {
+			buf := make([]byte, 0, size)
+			return &buf
+		},
+		WithResetFn[*[]byte](func(c *[]byte) *[]byte {
+			*c = (*c)[:0]
+			return c
+		}),
+	)
+	defer p.Close()
+
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			obj, _ := p.Get()
+			for i := 0; i < rand.Intn(10); i++ {
+				//obj.Ch <- struct{}{}
 			}
 			p.Put(obj)
 		}
