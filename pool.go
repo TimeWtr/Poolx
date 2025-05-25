@@ -16,7 +16,6 @@ package poolx
 
 import (
 	"fmt"
-	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -27,12 +26,12 @@ const (
 
 type Options[T any] func(p *Pool[T])
 
-// WithMaxAge 设置对象最大的存活周期，如果为-1则永不过期
-func WithMaxAge[T any](maxAge int64) Options[T] {
-	return func(o *Pool[T]) {
-		o.maxAge = maxAge
-	}
-}
+//// WithMaxAge 设置对象最大的存活周期，如果为-1则永不过期
+//func WithMaxAge[T any](maxAge int64) Options[T] {
+//	return func(o *Pool[T]) {
+//		o.maxAge = maxAge
+//	}
+//}
 
 // WithResetFn 配置对象的重置方法，用于对象不再使用时放回Pool之间对复杂对象进行重置。
 func WithResetFn[T any](resetFn func(T) T) Options[T] {
@@ -69,24 +68,20 @@ type Metrics struct {
 
 type Pool[T any] struct {
 	p              atomic.Pointer[sync.Pool] // 以官方包的pool为基础封装
-	maxAge         int64                     // 对象的最大存活时间
 	capacity       atomic.Int32              // 池的容量限制
-	currentCounter atomic.Int32              // 当前池中已分配的对象数量
+	currentCounter atomic.Int32              // 当前活跃的对象数量，即被从Pool中取出还未放回的对象
 	newFn          func() T                  // 初始化的对象的方法
 	resetFn        func(T) T                 // 重置对象的方法
 	closeFn        func(T)                   // 关闭对象(释放资源)的方法
 	enableMetrics  bool                      // 是否开启监控，默认不开启
 	metrics        Metrics                   // 指标数据
 	status         atomic.Int32              // 标识Pool状态
-	dataMu         sync.Mutex                // 数据锁
 }
 
 func NewPool[T any](capacity int32, newFn func() T, opts ...Options[T]) (*Pool[T], error) {
 	p := &Pool[T]{
-		maxAge:  NotExpired,
 		metrics: Metrics{},
 		newFn:   newFn,
-		dataMu:  sync.Mutex{},
 		status:  atomic.Int32{},
 	}
 
@@ -98,18 +93,9 @@ func NewPool[T any](capacity int32, newFn func() T, opts ...Options[T]) (*Pool[T
 	p.p.Store(&sync.Pool{
 		New: func() interface{} {
 			t := newFn()
-			// 设置SetFinalizer，当对象被GC回收时减少计数器，并删除对象集合中的
-			// 对象-元数据的映射关系
-			obj := &wrapT[T]{data: t}
-			runtime.SetFinalizer(obj, func(_ *wrapT[T]) {
-				p.currentCounter.Add(-1)
-			})
-
 			if p.enableMetrics {
 				p.metrics.allocations.Add(1)
 			}
-
-			p.currentCounter.Add(1)
 
 			return t
 		},
@@ -120,7 +106,6 @@ func NewPool[T any](capacity int32, newFn func() T, opts ...Options[T]) (*Pool[T
 	const scale = 0.3
 	preloadSize := float64(capacity) * scale
 	for i := 0; i < int(preloadSize); i++ {
-		p.currentCounter.Add(1)
 		obj, ok := p.p.Load().Get().(T)
 		if !ok {
 			return nil, fmt.Errorf("pool does not implement T")
@@ -132,33 +117,38 @@ func NewPool[T any](capacity int32, newFn func() T, opts ...Options[T]) (*Pool[T
 }
 
 func (p *Pool[T]) Get() (t T, err error) {
-	if p.status.Load() == Closed {
-		return t, ErrPoolClosed
-	}
+	for {
+		if p.status.Load() == Closed {
+			return t, ErrPoolClosed
+		}
 
-	p.dataMu.Lock()
-	defer p.dataMu.Unlock()
-	currentCounter := p.currentCounter.Load()
-	if currentCounter >= p.capacity.Load() {
-		return t, ErrCountOverCapacity
+		currentCounter := p.currentCounter.Load()
+		if currentCounter >= p.capacity.Load() {
+			return t, ErrCountOverCapacity
+		}
+
+		if p.currentCounter.CompareAndSwap(currentCounter, currentCounter+1) {
+			// 再次检查池状态（防止关闭后操作）
+			if p.status.Load() == Closed {
+				p.currentCounter.Add(-1)
+				return t, ErrPoolClosed
+			}
+			break
+		}
 	}
 
 	t, ok := p.p.Load().Get().(T)
 	if !ok {
-		runtime.SetFinalizer(&wrapT[T]{data: t}, nil)
 		p.currentCounter.Add(-1)
 		return t, ErrObjectType
 	}
 
 	p.metrics.totalGets.Add(1)
-
 	return t, nil
 }
 
 func (p *Pool[T]) Put(t T) {
-	runtime.SetFinalizer(&wrapT[T]{data: t}, nil)
 	p.currentCounter.Add(-1)
-
 	if p.status.Load() == Closed {
 		if p.closeFn != nil {
 			p.closeFn(t)
@@ -167,8 +157,6 @@ func (p *Pool[T]) Put(t T) {
 		return
 	}
 
-	p.dataMu.Lock()
-	defer p.dataMu.Unlock()
 	currentCounter := p.currentCounter.Load()
 	if currentCounter >= p.capacity.Load() {
 		// 池中对象已经达到最大限制，直接丢弃对象
@@ -195,12 +183,12 @@ func (p *Pool[T]) Close() {
 		return
 	}
 
-	p.dataMu.Lock()
-	defer p.dataMu.Unlock()
 	newPool := &sync.Pool{New: p.p.Load().New}
 	p.p.Store(newPool)
 }
 
+// Stats 返回监控指标数据，allocations分配的对象总数，reuses复用对象总数，
+// discards因超过最大容量而直接丢弃的对象总数
 func (p *Pool[T]) Stats() (allocations, reuses, discards int64) {
 	t := p.metrics.totalGets.Load()
 	a := p.metrics.allocations.Load()
