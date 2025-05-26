@@ -18,3 +18,19 @@ const (
 	Running = iota
 	Closed
 )
+
+const (
+	_1KB = 1 << 10
+	_2KB = 2 << 10
+	_4KB = 4 << 10
+	_8KB = 8 << 10
+)
+
+const (
+	_1KBIndex = iota
+	_2KBIndex
+	_4KBIndex
+	_8KBIndex
+)
+
+const PoolCount = 4

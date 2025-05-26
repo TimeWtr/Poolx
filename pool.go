@@ -15,23 +15,11 @@
 package poolx
 
 import (
-	"fmt"
 	"sync"
 	"sync/atomic"
 )
 
-const (
-	NotExpired = -1 // 对象永不过期
-)
-
 type Options[T any] func(p *Pool[T])
-
-//// WithMaxAge 设置对象最大的存活周期，如果为-1则永不过期
-//func WithMaxAge[T any](maxAge int64) Options[T] {
-//	return func(o *Pool[T]) {
-//		o.maxAge = maxAge
-//	}
-//}
 
 // WithResetFn 配置对象的重置方法，用于对象不再使用时放回Pool之间对复杂对象进行重置。
 func WithResetFn[T any](resetFn func(T) T) Options[T] {
@@ -55,10 +43,6 @@ func WithMetrics[T any]() Options[T] {
 	}
 }
 
-type wrapT[T any] struct {
-	data T
-}
-
 // Metrics 监控数据
 type Metrics struct {
 	allocations atomic.Int64 // 总共分配的对象计数
@@ -67,15 +51,15 @@ type Metrics struct {
 }
 
 type Pool[T any] struct {
-	p              atomic.Pointer[sync.Pool] // 以官方包的pool为基础封装
-	capacity       atomic.Int32              // 池的容量限制
-	currentCounter atomic.Int32              // 当前活跃的对象数量，即被从Pool中取出还未放回的对象
-	newFn          func() T                  // 初始化的对象的方法
-	resetFn        func(T) T                 // 重置对象的方法
-	closeFn        func(T)                   // 关闭对象(释放资源)的方法
-	enableMetrics  bool                      // 是否开启监控，默认不开启
-	metrics        Metrics                   // 指标数据
-	status         atomic.Int32              // 标识Pool状态
+	p              atomic.Pointer[[PoolCount]*sync.Pool] // 以官方包的pool为基础封装
+	capacity       atomic.Int32                          // 池的容量限制
+	currentCounter atomic.Int32                          // 当前活跃的对象数量，即被从Pool中取出还未放回的对象
+	newFn          func() T                              // 初始化的对象的方法
+	resetFn        func(T) T                             // 重置对象的方法
+	closeFn        func(T)                               // 关闭对象(释放资源)的方法
+	enableMetrics  bool                                  // 是否开启监控，默认不开启
+	metrics        Metrics                               // 指标数据
+	status         atomic.Int32                          // 标识Pool状态
 }
 
 func NewPool[T any](capacity int32, newFn func() T, opts ...Options[T]) (*Pool[T], error) {
@@ -90,33 +74,45 @@ func NewPool[T any](capacity int32, newFn func() T, opts ...Options[T]) (*Pool[T
 	}
 
 	p.status.Store(Running)
-	p.p.Store(&sync.Pool{
-		New: func() interface{} {
-			t := newFn()
-			if p.enableMetrics {
-				p.metrics.allocations.Add(1)
-			}
+	var pools [4]*sync.Pool
+	for i := range pools {
+		pools[i] = &sync.Pool{
+			New: func() interface{} {
+				t := newFn()
+				if p.enableMetrics {
+					p.metrics.allocations.Add(1)
+				}
 
-			return t
-		},
-	})
-	p.capacity.Store(capacity)
-
-	// 冷启动时预分配容量30%的对象数量，减少首次请求时的延迟抖动
-	const scale = 0.3
-	preloadSize := float64(capacity) * scale
-	for i := 0; i < int(preloadSize); i++ {
-		obj, ok := p.p.Load().Get().(T)
-		if !ok {
-			return nil, fmt.Errorf("pool does not implement T")
+				return t
+			},
 		}
-		p.p.Load().Put(obj)
+
+		// 冷启动时预分配容量固定比例的对象数量，减少首次请求时的延迟抖动
+		// 1KB和2KB的缓冲池预热30%比例的对象
+		var scale float64
+		if i <= _2KBIndex {
+			scale = 0.3
+		} else if i == _4KBIndex {
+			// 4KB的缓冲池预热15%比例的对象
+			scale = 0.15
+		} else {
+			// 超过KB以上的缓冲池不进行预热处理
+			continue
+		}
+		preloadSize := float64(capacity) * scale
+		for j := 0; j < int(preloadSize); j++ {
+			obj, _ := pools[i].Get().(T)
+			pools[i].Put(obj)
+		}
 	}
+	p.p.Store(&pools)
+	p.capacity.Store(capacity)
 
 	return p, nil
 }
 
-func (p *Pool[T]) Get() (t T, err error) {
+func (p *Pool[T]) Get(size int64) (t T, err error) {
+	idx := p.selector(size)
 	for {
 		if p.status.Load() == Closed {
 			return t, ErrPoolClosed
@@ -137,7 +133,7 @@ func (p *Pool[T]) Get() (t T, err error) {
 		}
 	}
 
-	t, ok := p.p.Load().Get().(T)
+	t, ok := p.p.Load()[idx].Get().(T)
 	if !ok {
 		p.currentCounter.Add(-1)
 		return t, ErrObjectType
@@ -147,7 +143,8 @@ func (p *Pool[T]) Get() (t T, err error) {
 	return t, nil
 }
 
-func (p *Pool[T]) Put(t T) {
+func (p *Pool[T]) Put(t T, size int64) {
+	idx := p.selector(size)
 	p.currentCounter.Add(-1)
 	if p.status.Load() == Closed {
 		if p.closeFn != nil {
@@ -175,7 +172,7 @@ func (p *Pool[T]) Put(t T) {
 		p.resetFn(t)
 	}
 
-	p.p.Load().Put(t)
+	p.p.Load()[idx].Put(t)
 }
 
 func (p *Pool[T]) Close() {
@@ -183,8 +180,24 @@ func (p *Pool[T]) Close() {
 		return
 	}
 
-	newPool := &sync.Pool{New: p.p.Load().New}
-	p.p.Store(newPool)
+	var pools [PoolCount]*sync.Pool
+	p.p.Store(&pools)
+}
+
+// selector 根据对象的大小确定写入哪个缓冲池，返回的是缓冲池列表的下标
+func (p *Pool[T]) selector(size int64) (idx int) {
+	switch {
+	case size < _1KB:
+		idx = 0
+	case size < _2KB:
+		idx = 1
+	case size < _4KB:
+		idx = 2
+	default:
+		idx = 3
+	}
+
+	return
 }
 
 // Stats 返回监控指标数据，allocations分配的对象总数，reuses复用对象总数，
